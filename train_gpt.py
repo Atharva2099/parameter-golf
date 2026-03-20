@@ -674,6 +674,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        num_train_loops: int,
+        num_eval_loops: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -681,6 +683,8 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.num_train_loops = num_train_loops
+        self.num_eval_loops = num_eval_loops        
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -716,21 +720,24 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-        skips: list[Tensor] = []
-
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            qd = lora.q_loras[i] if lora else None
-            vd = lora.v_loras[i] if lora else None
-            x = self.blocks[i](x, x0, qd, vd)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            qd = lora.q_loras[bi] if lora else None
-            vd = lora.v_loras[bi] if lora else None
-            x = self.blocks[bi](x, x0, qd, vd)
+        num_loops = self.num_train_loops if self.training else self.num_eval_loops
+    
+        for _ in range(num_loops):
+            skips: list[Tensor] = []
+            for i in range(self.num_encoder_layers):
+                qd = lora.q_loras[i] if lora else None
+                vd = lora.v_loras[i] if lora else None
+                x = self.blocks[i](x, x0, qd, vd)
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                bi = self.num_encoder_layers + i
+                if skips:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                qd = lora.q_loras[bi] if lora else None
+                vd = lora.v_loras[bi] if lora else None
+                x = self.blocks[bi](x, x0, qd, vd)
+    
+        # OUTSIDE the loop
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits = F.linear(x, self.tok_emb.weight)
@@ -743,8 +750,8 @@ class GPT(nn.Module):
             return F.cross_entropy(
                 logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none").reshape(bsz, sl)
         return F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), target_ids.reshape(-1), reduction="mean")
-
-
+    
+    
 # -----------------------------
 # TEST-TIME TRAINING (LoRA)
 # -----------------------------
@@ -1067,6 +1074,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        num_train_loops=args.num_train_loops,
+        num_eval_loops=args.num_eval_loops,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
