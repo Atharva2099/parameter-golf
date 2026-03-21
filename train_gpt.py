@@ -58,8 +58,9 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    num_train_loops = int(os.environ.get("NUM_TRAIN_LOOPS", 3))
+    num_train_loops = int(os.environ.get("NUM_TRAIN_LOOPS", 2))
     num_eval_loops = int(os.environ.get("NUM_EVAL_LOOPS", 3))
+    use_bitnet = bool(int(os.environ.get("USE_BITNET", "0")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -530,6 +531,35 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
+class BitLinear(nn.Linear):
+    """BitNet-style ternary linear layer.
+
+    Weights are full precision for the optimizer, but quantized to {-1, 0, +1}
+    in the forward pass using a straight-through estimator (STE).
+    This means the model trains with quantized weights — no post-training
+    quantization surprise.
+    """
+    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+        super().__init__(in_features, out_features, bias=bias)
+        # Per-output-channel scale, learned implicitly from weight magnitude
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Compute per-output-channel scale (mean absolute value)
+        w = self.weight
+        scale = w.abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
+        # Normalize, round to {-1, 0, +1}, apply STE
+        w_normalized = w / scale
+        w_ternary = torch.clamp(torch.round(w_normalized), -1, 1)
+        # STE: forward uses ternary, backward uses full precision gradient
+        w_q = (w_ternary - w).detach() + w
+        # Also quantize activations to int8 range (AbsMax quantization, per-token)
+        x_scale = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
+        x_q = (x / x_scale).clamp(-1, 1) * 127
+        x_q = ((x_q.round() - x / x_scale * 127).detach() + x / x_scale * 127) / 127 * x_scale
+        bias = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.linear(x_q.to(x.dtype), (w_q * scale).to(x.dtype), bias)
+
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -577,6 +607,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        use_bitnet: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -589,10 +620,11 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
+        Linear = BitLinear if use_bitnet else CastedLinear
+        self.c_q = Linear(dim, dim, bias=False)
+        self.c_k = Linear(dim, kv_dim, bias=False)
+        self.c_v = Linear(dim, kv_dim, bias=False)
+        self.proj = Linear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
@@ -625,11 +657,12 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, use_bitnet: bool = False):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
+        Linear = BitLinear if use_bitnet else CastedLinear
+        self.fc = Linear(dim, hidden, bias=False)
+        self.proj = Linear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
@@ -646,11 +679,12 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_bitnet: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, use_bitnet=use_bitnet)
+        self.mlp = MLP(dim, mlp_mult, use_bitnet=use_bitnet)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -686,6 +720,7 @@ class GPT(nn.Module):
         qk_gain_init: float,
         num_train_loops: int,
         num_eval_loops: int,
+        use_bitnet: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -694,7 +729,7 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.num_train_loops = num_train_loops
-        self.num_eval_loops = num_eval_loops        
+        self.num_eval_loops = num_eval_loops
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -709,6 +744,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    use_bitnet=use_bitnet,
                 )
                 for i in range(num_layers)
             ]
@@ -1086,9 +1122,10 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         num_train_loops=args.num_train_loops,
         num_eval_loops=args.num_eval_loops,
+        use_bitnet=args.use_bitnet,
     ).to(device).bfloat16()
     for module in base_model.modules():
-        if isinstance(module, CastedLinear):
+        if isinstance(module, (CastedLinear, BitLinear)):
             module.float()
         if isinstance(module, Rotary):
             module.inv_freq.data = module.inv_freq.data.float()
@@ -1149,7 +1186,7 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} use_bitnet:{args.use_bitnet}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
