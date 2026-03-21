@@ -58,7 +58,7 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    num_train_loops = int(os.environ.get("NUM_TRAIN_LOOPS", 1))
+    num_train_loops = int(os.environ.get("NUM_TRAIN_LOOPS", 3))
     num_eval_loops = int(os.environ.get("NUM_EVAL_LOOPS", 3))
 
     # Model shape.
