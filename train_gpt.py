@@ -350,6 +350,22 @@ def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -max_val, max_val).to(torch.int8).contiguous()
     return q, scale
 
+def snap_bitlinear_weights_to_ternary(model: nn.Module) -> None:
+    """Snap BitLinear weights to their ternary values in-place before serialization.
+
+    During training, the optimizer keeps full-precision weights and BitLinear
+    quantizes on-the-fly in forward(). Before saving, we permanently replace
+    the weights with scale * ternary so the int8 pipeline sees clean values.
+    """
+    with torch.no_grad():
+        for module in model.modules():
+            if isinstance(module, BitLinear):
+                w = module.weight
+                scale = w.abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
+                w_ternary = torch.clamp(torch.round(w / scale), -1, 1)
+                module.weight.copy_(w_ternary * scale)
+
+
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
@@ -552,12 +568,8 @@ class BitLinear(nn.Linear):
         w_ternary = torch.clamp(torch.round(w_normalized), -1, 1)
         # STE: forward uses ternary, backward uses full precision gradient
         w_q = (w_ternary - w).detach() + w
-        # Also quantize activations to int8 range (AbsMax quantization, per-token)
-        x_scale = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
-        x_q = (x / x_scale).clamp(-1, 1) * 127
-        x_q = ((x_q.round() - x / x_scale * 127).detach() + x / x_scale * 127) / 127 * x_scale
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x_q.to(x.dtype), (w_q * scale).to(x.dtype), bias)
+        return F.linear(x, (w_q * scale).to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -1359,6 +1371,9 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
+
+    if args.use_bitnet:
+        snap_bitlinear_weights_to_ternary(base_model)
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
