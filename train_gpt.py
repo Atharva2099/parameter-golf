@@ -364,6 +364,7 @@ def snap_bitlinear_weights_to_ternary(model: nn.Module) -> None:
                 scale = w.abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
                 w_ternary = torch.clamp(torch.round(w / scale), -1, 1)
                 module.weight.copy_(w_ternary * scale)
+                module._snapped = True
 
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
@@ -557,11 +558,15 @@ class BitLinear(nn.Linear):
     """
     def __init__(self, in_features: int, out_features: int, bias: bool = False):
         super().__init__(in_features, out_features, bias=bias)
-        # Per-output-channel scale, learned implicitly from weight magnitude
+        self._snapped = False  # set True after weights are snapped to ternary
 
     def forward(self, x: Tensor) -> Tensor:
-        # Compute per-output-channel scale (mean absolute value)
         w = self.weight
+        if self._snapped:
+            # Weights already in final ternary*scale form, use directly
+            bias = self.bias.to(x.dtype) if self.bias is not None else None
+            return F.linear(x, w.to(x.dtype), bias)
+        # Compute per-output-channel scale (mean absolute value)
         scale = w.abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
         # Normalize, round to {-1, 0, +1}, apply STE
         w_normalized = w / scale
@@ -1407,6 +1412,10 @@ def main() -> None:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    if args.use_bitnet:
+        for module in base_model.modules():
+            if isinstance(module, BitLinear):
+                module._snapped = True
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
