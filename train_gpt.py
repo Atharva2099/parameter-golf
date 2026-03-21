@@ -662,9 +662,12 @@ class Block(nn.Module):
         n = self.attn_norm(x)
         qd = q_delta_fn(n) if q_delta_fn is not None else None
         vd = v_delta_fn(n) if v_delta_fn is not None else None
+        # Parallel attention + FFN: both operate on same normalized input
         attn_out = self.attn(n, qd, vd)
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        mlp_out = self.mlp(n)
+        attn_scaled = self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        mlp_scaled = self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        x = x + attn_scaled + mlp_scaled
         return x
 
 
